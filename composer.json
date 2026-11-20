@@ -1,0 +1,24 @@
+{
+    "name": "external_trashbin/external_trashbin",
+    "description": "Dev tooling only; the app itself has no Composer dependencies.",
+    "license": "AGPL-3.0-or-later",
+    "require-dev": {
+        "nextcloud/ocp": "v35.0.3",
+        "phpunit/phpunit": "^12.0"
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "OCA\\External_Trashbin\\": "lib/",
+            "OCA\\External_Trashbin\\Tests\\": "tests/",
+            "OCP\\": "vendor/nextcloud/ocp/OCP/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit tests"
+    },
+    "config": {
+        "platform": {
+            "php": "8.3"
+        }
+    }
+}

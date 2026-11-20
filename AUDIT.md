@@ -1,7 +1,7 @@
 # Final hardcoding and portability audit
 
-Release: **2.4.0**  
-Target: **Nextcloud 34**
+Release: **2.5.0**  
+Target: **Nextcloud 34-35**
 
 ## Runtime values not hardcoded
 
@@ -24,8 +24,18 @@ These values are application or Nextcloud protocol identifiers, not deployment a
 - External recycle directory: `.recycle`
 - Nextcloud mount types: `external` and `external-session`
 - DAV deleted-file suffix: `.d<timestamp>`
-- Nextcloud compatibility: major version 34
+- Nextcloud compatibility: major versions 34 and 35
 - Background retention interval: 30 minutes
+- Recycle-move retry budget: 3 attempts, 200 ms linear backoff
+- Storage wrapper priority: 2, i.e. directly inside `OCA\Files_Trashbin\Storage` (priority 1) and outside `oc_encryption` (priority 2, registered earlier); `StorageFactory::wrap()` applies wrappers in descending priority order
+
+## Hardening changes in 2.5.0
+
+- A failed recycle move no longer falls through to Nextcloud's own trash bin, which would copy the external payload into the account's home storage and quota. The delete is refused instead, with the reason reported to the client.
+- `copy()` results are verified on the storage before the original is removed, and a copy is only discarded while the original is provably still present.
+- A `rename()` that lands remotely but reports failure is detected instead of being treated as a failed attempt.
+- The storage wrapper is registered inside the trash-bin wrapper, so a delete that follows a recycle move is intercepted before it can reach the real storage. Folder deletes no longer report a 403 after a successful recycle.
+- Restore passes an explicit propagation time, which Nextcloud 35's typed `Propagator::propagateChange()` requires.
 
 ## Hardening changes in 2.4.0
 
@@ -37,4 +47,4 @@ These values are application or Nextcloud protocol identifiers, not deployment a
 
 ## Deliberate compatibility boundary
 
-The custom trash backend API is under `OCA\\Files_Trashbin`, not the stable public `OCP` namespace. The package therefore remains restricted to Nextcloud 34 and must be reviewed before enabling it on another major release.
+The custom trash backend API is under `OCA\\Files_Trashbin`, not the stable public `OCP` namespace. Every app-private API in use (`ITrashBackend`, `MoveToTrashEvent`, `Expiration::isExpired()`, `Filesystem::addStorageWrapper()`, `Storage\\Wrapper\\Wrapper` method signatures) is identical between the Nextcloud 34.0.0 and 35.0.0 tags, so both majors are declared supported. Any further major release must be reviewed before the app is enabled on it.

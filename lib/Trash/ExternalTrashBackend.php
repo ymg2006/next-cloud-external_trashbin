@@ -16,6 +16,8 @@ use OCA\External_Trashbin\Storage\ExternalMount;
 use OCA\Files_Trashbin\Trash\ITrashBackend;
 use OCA\Files_Trashbin\Trash\ITrashItem;
 use OCP\AppFramework\Db\DoesNotExistException;
+use OCP\AppFramework\Utility\ITimeFactory;
+use OCP\Files\Folder;
 use OCP\Files\GenericFileException;
 use OCP\Files\IRootFolder;
 use OCP\Files\Node;
@@ -30,6 +32,7 @@ final class ExternalTrashBackend implements ITrashBackend {
         private TrashRecordMapper $mapper,
         private IRootFolder $rootFolder,
         private IUserManager $userManager,
+        private ITimeFactory $timeFactory,
         private LoggerInterface $logger,
     ) {
     }
@@ -70,13 +73,47 @@ final class ExternalTrashBackend implements ITrashBackend {
         }
     }
 
+    /**
+     * Entries inside a deleted folder are still on the external resource, so
+     * they can be listed straight from the physical `.recycle` directory. They
+     * share the parent's metadata record and carry their own relative path.
+     *
+     * @return ITrashItem[]
+     */
     public function listTrashFolder(ITrashItem $folder): array {
-        // Folder contents remain inside the external resource, but are restored/deleted as one item.
-        return [];
+        $externalFolder = $this->requireExternalItem($folder);
+        $node = $externalFolder->getNode();
+        if (!$node instanceof Folder) {
+            return [];
+        }
+
+        try {
+            $children = $node->getDirectoryListing();
+        } catch (\Throwable $e) {
+            $this->logger->debug('Unable to list the contents of an external trash folder', [
+                'app' => 'external_trashbin',
+                'recordId' => $externalFolder->getRecord()->getId(),
+                'recyclePath' => $node->getInternalPath(),
+                'exception' => $e,
+            ]);
+            return [];
+        }
+
+        $items = [];
+        foreach ($children as $child) {
+            $items[] = $this->makeChildTrashItem($externalFolder, $child);
+        }
+
+        return $items;
     }
 
     public function restoreItem(ITrashItem $item): void {
         $externalItem = $this->requireExternalItem($item);
+        if ($externalItem->getRelativePath() !== '') {
+            $this->restoreFolderEntry($externalItem);
+            return;
+        }
+
         $record = $externalItem->getRecord();
 
         try {
@@ -118,7 +155,66 @@ final class ExternalTrashBackend implements ITrashBackend {
 
     public function removeItem(ITrashItem $item): void {
         $externalItem = $this->requireExternalItem($item);
+        if ($externalItem->getRelativePath() !== '') {
+            $this->removeFolderEntry($externalItem);
+            return;
+        }
+
         $this->removeRecord($externalItem->getRecord());
+    }
+
+    /**
+     * Restore a single entry out of a deleted folder. The folder itself stays
+     * in the trash, so its metadata record is kept and only this entry is
+     * moved back below the folder's original location, recreating the original
+     * directory structure when it no longer exists.
+     */
+    private function restoreFolderEntry(ExternalTrashItem $item): void {
+        $record = $item->getRecord();
+        $node = $item->getNode();
+        $recyclePath = $node->getInternalPath();
+
+        try {
+            $storage = $node->getStorage();
+            $target = $this->uniqueRestoreTarget(
+                $storage,
+                ltrim($record->getOriginalPath(), '/') . '/' . $item->getRelativePath(),
+            );
+
+            $recycleManager = new RecycleManager($storage, $this->logger);
+            if (!$recycleManager->restore($recyclePath, $target)) {
+                throw new GenericFileException('The external storage refused the restore rename');
+            }
+
+            $this->refreshCacheAfterRestore($storage, $recyclePath, $target, $record);
+        } catch (\Throwable $e) {
+            $this->logger->error('Unable to restore an entry of an external trash folder', [
+                'app' => 'external_trashbin',
+                'recordId' => $record->getId(),
+                'mountPoint' => $record->getMountPoint(),
+                'recyclePath' => $recyclePath,
+                'relativePath' => $item->getRelativePath(),
+                'exception' => $e,
+            ]);
+
+            throw new GenericFileException('Unable to restore the external trash item: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Permanently delete a single entry out of a deleted folder. The folder and
+     * its metadata record stay in the trash.
+     */
+    private function removeFolderEntry(ExternalTrashItem $item): void {
+        try {
+            $item->getNode()->delete();
+        } catch (NotFoundException) {
+            // Already gone on the external resource; nothing left to delete.
+        } catch (\Throwable $e) {
+            throw new GenericFileException(
+                'The external resource is unavailable or refused permanent deletion: ' . $e->getMessage()
+            );
+        }
     }
 
     /**
@@ -145,16 +241,27 @@ final class ExternalTrashBackend implements ITrashBackend {
         return false;
     }
 
+    /**
+     * Resolves ids of root items *and* of entries inside a deleted folder,
+     * which is what the trash preview endpoint asks for when a folder is
+     * opened in the Deleted files view.
+     */
     public function getTrashNodeById(IUser $user, int $fileId): ?Node {
-        foreach ($this->listTrashRoot($user) as $item) {
-            if ($item->getId() === $fileId) {
-                try {
-                    return $this->getSourceNode($this->requireExternalItem($item)->getRecord());
-                } catch (\Throwable) {
-                    return null;
-                }
+        try {
+            $userFolder = $this->rootFolder->getUserFolder($user->getUID());
+        } catch (\Throwable) {
+            return null;
+        }
+
+        foreach ($userFolder->getById($fileId) as $node) {
+            if (!ExternalMount::isSupported($node->getMountPoint()->getMountType())) {
+                continue;
+            }
+            if (RecycleManager::isInRecycle($node->getInternalPath())) {
+                return $node;
             }
         }
+
         return null;
     }
 
@@ -176,6 +283,24 @@ final class ExternalTrashBackend implements ITrashBackend {
         );
     }
 
+    /**
+     * Build the trash item for one entry of a deleted folder. Metadata record,
+     * deletion time and deleting user come from the deleted folder; name, path
+     * and file id come from the physical entry below `.recycle`.
+     */
+    private function makeChildTrashItem(ExternalTrashItem $parent, Node $child): ExternalTrashItem {
+        return new ExternalTrashItem(
+            $parent->getRecord(),
+            $this,
+            $parent->getOriginalLocation() . '/' . $child->getName(),
+            $parent->getDeletedTime(),
+            $parent->getTrashPath() . '/' . $child->getName(),
+            $child,
+            $parent->getUser(),
+            $parent->getDeletedBy(),
+            ltrim($parent->getRelativePath() . '/' . $child->getName(), '/'),
+        );
+    }
 
     private function findRecordForDavName(string $userId, string $name): TrashRecord {
         try {
@@ -281,7 +406,20 @@ final class ExternalTrashBackend implements ITrashBackend {
                 $targetPath,
                 \OC\Files\Cache\Scanner::SCAN_RECURSIVE,
             );
-            $storage->getUpdater()->propagate($targetPath);
+            // Updater::propagate() still accepts a null time, but
+            // Propagator::propagateChange() is typed `int` since Nextcloud 35
+            // and raises a TypeError on null. Always pass a concrete time.
+            $mtime = $storage->filemtime($targetPath);
+            $time = is_int($mtime) && $mtime > 0 ? $mtime : $this->timeFactory->getTime();
+            $updater = $storage->getUpdater();
+            $updater->propagate($targetPath, $time);
+
+            // Restoring one entry of a deleted folder leaves that folder's size
+            // and etag stale, so propagate the vacated parent as well.
+            $recycleParent = dirname($recyclePath);
+            if ($recycleParent !== '.' && $recycleParent !== '' && $cache->inCache($recycleParent)) {
+                $updater->propagate($recycleParent, $time);
+            }
         } catch (\Throwable $e) {
             // The network rename has already succeeded. A cache refresh failure
             // must not turn a successful restore into a DAV 404. External

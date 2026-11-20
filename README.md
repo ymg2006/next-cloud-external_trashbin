@@ -1,4 +1,4 @@
-# External Trashbin 2.4.0 for Nextcloud 34
+# External Trashbin 2.5.0 for Nextcloud 34-35
 
 External Trashbin keeps deleted external-storage payloads on the same external
 resource while integrating them with Nextcloud's normal **Deleted files** view.
@@ -33,13 +33,14 @@ validated on staging because their rename and directory semantics can differ.
 
 ## Compatibility
 
-- Nextcloud: **34 only**
-- PHP: **8.2 or later**
+- Nextcloud: **34 and 35**
+- PHP: **8.2 or later** (Nextcloud 35 raises its own floor to 8.3)
 - Database: uses Nextcloud's database abstraction and does not hardcode a table
   prefix or database engine
 
 The custom trash contracts are currently under the app-private
-`OCA\\Files_Trashbin\\Trash` namespace. Every Nextcloud major upgrade therefore
+`OCA\\Files_Trashbin\\Trash` namespace. Every app-private API used is identical
+between the Nextcloud 34.0.0 and 35.0.0 tags, but each major upgrade still
 requires a compatibility review before the app is enabled.
 
 ## Hardcoding audit
@@ -51,13 +52,13 @@ name, Unix user, or installation path.
 
 Intentional protocol/application constants are documented in [AUDIT.md](AUDIT.md).
 
-Version 2.4.0 also restricts its storage wrapper to external mounts only. It no
+Version 2.4.0 also restricted its storage wrapper to external mounts only. It no
 longer changes file operations on primary/internal storage.
 
 ## Upgrade from 2.3.x
 
 No database migration is required. Existing rows and physical recycle paths are
-compatible with 2.4.0.
+compatible with 2.5.0.
 
 Back up the Nextcloud database and the external storage before upgrading.
 
@@ -68,10 +69,10 @@ The LinuxServer.io image normally provides an `occ` wrapper that executes as
 
 ```bash
 docker exec nextcloud occ app:disable external_trashbin || true
-docker cp external_trashbin-2.4.0-nc34.zip nextcloud:/tmp/
+docker cp external_trashbin-2.5.0-nc34-35.zip nextcloud:/tmp/
 docker exec nextcloud sh -c '
 rm -rf /config/www/nextcloud/apps/external_trashbin &&
-unzip -q /tmp/external_trashbin-2.4.0-nc34.zip -d /config/www/nextcloud/apps &&
+unzip -q /tmp/external_trashbin-2.5.0-nc34-35.zip -d /config/www/nextcloud/apps &&
 chown -R abc:abc /config/www/nextcloud/apps/external_trashbin
 '
 docker exec nextcloud occ app:enable external_trashbin
@@ -89,10 +90,10 @@ docker exec -u abc nextcloud php /app/www/public/occ app:enable external_trashbi
 
 ```bash
 docker exec -u www-data NEXTCLOUD_CONTAINER php /var/www/html/occ app:disable external_trashbin || true
-docker cp external_trashbin-2.4.0-nc34.zip NEXTCLOUD_CONTAINER:/tmp/
+docker cp external_trashbin-2.5.0-nc34-35.zip NEXTCLOUD_CONTAINER:/tmp/
 docker exec NEXTCLOUD_CONTAINER sh -c '
 rm -rf /var/www/html/custom_apps/external_trashbin &&
-unzip -q /tmp/external_trashbin-2.4.0-nc34.zip -d /var/www/html/custom_apps &&
+unzip -q /tmp/external_trashbin-2.5.0-nc34-35.zip -d /var/www/html/custom_apps &&
 chown -R www-data:www-data /var/www/html/custom_apps/external_trashbin
 '
 docker exec -u www-data NEXTCLOUD_CONTAINER php /var/www/html/occ app:enable external_trashbin
@@ -112,7 +113,7 @@ docker exec nextcloud occ app:getpath external_trashbin
 Expected version:
 
 ```text
-external_trashbin: 2.4.0
+external_trashbin: 2.5.0
 ```
 
 ## Production acceptance test
@@ -132,19 +133,42 @@ Use disposable files and folders:
    without deleting the database metadata.
 10. Reconnect and retry.
 11. Verify ordinary internal-storage trash behavior remains unchanged.
+12. Make `.recycle` unwritable for the mount's credentials, delete a file, and
+    confirm the client reports the refusal, the file is still there, the
+    Nextcloud log names the cause, and nothing landed in the account's own
+    **Deleted files**.
+13. Open a deleted folder in **Deleted files**, confirm its entries are listed,
+    download one, restore one entry (the folder must stay in the trash), and
+    permanently delete another (siblings must survive).
 
 ## Known limitations
 
-- Deleted folders appear as one trash item; browsing their contents inside
-  **Deleted files** is not implemented.
+- A deleted folder keeps one metadata record covering the whole folder.
+  Browsing it in **Deleted files** lists the entries directly from the
+  external resource, and single entries can be restored or permanently
+  deleted; the folder itself stays in the trash until it is restored or
+  removed as a whole. Restoring a single entry recreates the folder's original
+  path on the external storage if it no longer exists.
 - Session-authenticated mounts may be unavailable to background jobs until the
   user's session mounts them again.
 - Files manually placed inside `.recycle` are not imported because no metadata
   record exists.
 - File versions associated with an external file are not moved into this custom
   recycle area.
-- The package still depends on private Nextcloud 34 internals and should be
+- The package still depends on private Nextcloud internals and should be
   integration-tested after every Nextcloud maintenance update.
+- Since 2.5.0, a delete on an external mount is refused (the item stays in
+  place and the client reports the reason) if the app cannot move it into
+  `.recycle` after retries. Before 2.5.0 the delete continued and Nextcloud's
+  own trash bin absorbed the item, which pulled the external payload into the
+  account's home storage and quota. The new behavior trades a small chance of
+  "can't delete right now" for never moving external payloads into home
+  storage. Check the Nextcloud log (`external_trashbin` context) for the cause
+  before retrying.
+- A copy fallback that succeeds while the original cannot be removed leaves an
+  unregistered copy below `.recycle`. It is logged at `error` level with both
+  paths and has to be removed or restored manually: retention expiry only
+  covers items that have a metadata record.
 
 ## Recovery
 
